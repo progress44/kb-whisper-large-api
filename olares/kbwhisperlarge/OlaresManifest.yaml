@@ -6,7 +6,7 @@ metadata:
   icon: https://huggingface.co/front/assets/huggingface_logo-noborder.svg
   appid: kbwhisperlarge
   title: KB Whisper Large
-  version: "1.1.0"
+  version: "1.1.1"
   categories:
     - AI
     - Utilities

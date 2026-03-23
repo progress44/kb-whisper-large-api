@@ -73,10 +73,10 @@ jobs:
           old_manifest_version = manifest_version_match.group(2)
           old_api_version = api_version_match.group(1)
 
-          if not (old_app_version == old_manifest_version == old_api_version):
+          if not (old_chart_version == old_app_version == old_manifest_version == old_api_version):
               raise SystemExit(
-                  f"App version mismatch: chart appVersion={old_app_version}, "
-                  f"manifest={old_manifest_version}, api={old_api_version}"
+                  f"Version mismatch: chart={old_chart_version}, "
+                  f"chart appVersion={old_app_version}, manifest={old_manifest_version}, api={old_api_version}"
               )
 
           major, minor, patch = map(int, old_app_version.split("."))
@@ -92,22 +92,18 @@ jobs:
           else:
               raise SystemExit(f"Unsupported bump type: {bump}")
 
-          new_app_version = f"{major}.{minor}.{patch}"
-
-          cmaj, cmin, cpatch = map(int, old_chart_version.split("."))
-          cpatch += 1
-          new_chart_version = f"{cmaj}.{cmin}.{cpatch}"
+          new_version = f"{major}.{minor}.{patch}"
 
           chart = re.sub(
               r"^version:\s*\"?[0-9]+\.[0-9]+\.[0-9]+\"?\s*$",
-              f"version: {new_chart_version}",
+              f"version: {new_version}",
               chart,
               count=1,
               flags=re.M,
           )
           chart = re.sub(
               r"^appVersion:\s*\"?[0-9]+\.[0-9]+\.[0-9]+\"?\s*$",
-              f'appVersion: "{new_app_version}"',
+              f'appVersion: "{new_version}"',
               chart,
               count=1,
               flags=re.M,
@@ -115,7 +111,7 @@ jobs:
 
           manifest = re.sub(
               r"^(\s*)version:\s*\"?[0-9]+\.[0-9]+\.[0-9]+\"?\s*$",
-              rf'\1version: "{new_app_version}"',
+              rf'\1version: "{new_version}"',
               manifest,
               count=1,
               flags=re.M,
@@ -123,7 +119,7 @@ jobs:
 
           api_main = re.sub(
               r'version="[0-9]+\.[0-9]+\.[0-9]+"',
-              f'version="{new_app_version}"',
+              f'version="{new_version}"',
               api_main,
               count=1,
           )
@@ -134,9 +130,9 @@ jobs:
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
               f.write(f"old_version={old_app_version}\n")
-              f.write(f"new_version={new_app_version}\n")
+              f.write(f"new_version={new_version}\n")
               f.write(f"old_chart_version={old_chart_version}\n")
-              f.write(f"new_chart_version={new_chart_version}\n")
+              f.write(f"new_chart_version={new_version}\n")
           PY
 
       - name: Commit and push
