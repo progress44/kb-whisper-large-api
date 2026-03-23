@@ -1,12 +1,15 @@
 name: Bump Version
 
 on:
+  push:
+    branches:
+      - master
   workflow_dispatch:
     inputs:
       bump:
         description: "Semver bump type"
         required: true
-        default: patch
+        default: minor
         type: choice
         options:
           - patch
@@ -18,6 +21,7 @@ permissions:
 
 jobs:
   bump-version:
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -33,7 +37,7 @@ jobs:
       - name: Bump version values
         id: bump
         env:
-          BUMP: ${{ github.event.inputs.bump }}
+          BUMP: ${{ github.event.inputs.bump || 'minor' }}
         run: |
           python - <<'PY'
           import os
