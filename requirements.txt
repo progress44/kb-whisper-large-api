@@ -1,0 +1,10 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9
+python-dotenv>=1.0.0
+transformers>=4.52.0
+accelerate>=0.33.0
+torch>=2.7.0
+torchaudio>=2.7.0
+sentencepiece>=0.2.0
+safetensors>=0.4.0
