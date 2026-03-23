@@ -1,0 +1,47 @@
+name: Package Olares Chart
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release-chart:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.14.0
+
+      - name: Extract chart metadata
+        id: chart_info
+        run: |
+          CHART_DIR="olares/kbwhisperlarge"
+          VERSION=$(grep '^version:' "$CHART_DIR/Chart.yaml" | awk '{print $2}' | tr -d '"')
+          NAME=$(grep '^name:' "$CHART_DIR/Chart.yaml" | awk '{print $2}' | tr -d '"')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "tag=chart-v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Package chart
+        run: |
+          helm package olares/kbwhisperlarge -d .
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.chart_info.outputs.tag }}
+          name: ${{ steps.chart_info.outputs.name }}-${{ steps.chart_info.outputs.version }}
+          files: |
+            ${{ steps.chart_info.outputs.name }}-${{ steps.chart_info.outputs.version }}.tgz
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
