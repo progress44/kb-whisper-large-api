@@ -2,7 +2,7 @@ olaresManifest.version: "0.11.0"
 olaresManifest.type: app
 metadata:
   name: kbwhisperlarge
-  description: Private transcription API powered by KBLab kb-whisper-large.
+  description: Private transcription API powered by Hugging Face Whisper models.
   icon: https://huggingface.co/front/assets/huggingface_logo-noborder.svg
   appid: kbwhisperlarge
   title: KB Whisper Large
@@ -19,9 +19,8 @@ permission:
 spec:
   versionName: "gpu-cu128"
   fullDescription: |
-    KB Whisper Large exposes a transcription API on Olares using the model:
-
-    - `KBLab/kb-whisper-large`
+    KB Whisper Large exposes a transcription API on Olares using Whisper-compatible
+    Hugging Face model IDs selected per request.
 
     Endpoints
     - `GET /`
@@ -29,12 +28,12 @@ spec:
     - `GET /health`
       - Returns runtime health and model loading status.
     - `GET /v1/models`
-      - Returns the configured model id.
+      - Returns currently loaded model ids.
     - `POST /v1/audio/transcriptions`
       - OpenAI-style transcription endpoint using multipart form-data.
       - Request fields:
         - `file` (required)
-        - `model` (must be `KBLab/kb-whisper-large`)
+        - `model` (optional, any Whisper-compatible Hugging Face model id)
         - `language` (optional)
         - `prompt` (optional)
         - `response_format` (`json`, `verbose_json`, or `text`)
@@ -43,10 +42,12 @@ spec:
       - Simple alias that returns `{ "text": "..." }`.
 
     Example request
-    - `curl -X POST http://kbwhisperlarge-svc:8000/v1/audio/transcriptions -F "model=KBLab/kb-whisper-large" -F "file=@./sample.wav" -F "language=sv"`
+    - `curl -X POST http://kbwhisperlarge-svc:8000/v1/audio/transcriptions -F "model=openai/whisper-large-v3" -F "file=@./sample.wav" -F "language=en"`
 
     Notes
-    - First request may be slow while model weights are pulled into app data.
+    - First request for each model may be slow while model weights are pulled into app data.
+    - If `model` is omitted, default model `WHISPER_MODEL_ID` is used.
+    - Active models are cached in-memory with LRU eviction (size configured by `WHISPER_MAX_MODELS_IN_MEMORY`).
     - Hugging Face cache is persisted at `userspace.appData/huggingface`.
     - This package targets `amd64` Olares nodes with NVIDIA GPU support.
   developer: progress44

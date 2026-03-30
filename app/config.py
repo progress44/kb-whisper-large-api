@@ -10,6 +10,7 @@ class Config:
     PORT = int(os.getenv("PORT", "8000"))
 
     MODEL_ID = os.getenv("WHISPER_MODEL_ID", "KBLab/kb-whisper-large")
+    MAX_MODELS_IN_MEMORY = int(os.getenv("WHISPER_MAX_MODELS_IN_MEMORY", "2"))
     DEVICE = os.getenv("WHISPER_DEVICE", "auto")
     DEFAULT_LANGUAGE = os.getenv("WHISPER_DEFAULT_LANGUAGE", "sv")
 
@@ -26,6 +27,7 @@ class Config:
             raise ValueError("PORT must be positive")
         if cls.MAX_UPLOAD_SIZE_MB <= 0:
             raise ValueError("WHISPER_MAX_UPLOAD_SIZE_MB must be positive")
+        if cls.MAX_MODELS_IN_MEMORY <= 0:
+            raise ValueError("WHISPER_MAX_MODELS_IN_MEMORY must be positive")
         if not cls.MODEL_ID.strip():
             raise ValueError("WHISPER_MODEL_ID cannot be empty")
-

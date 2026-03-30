@@ -6,6 +6,7 @@ metadata:
   namespace: {{ .Release.Namespace }}
 data:
   WHISPER_MODEL_ID: {{ .Values.whisper.modelId | quote }}
+  WHISPER_MAX_MODELS_IN_MEMORY: {{ .Values.whisper.maxModelsInMemory | quote }}
   WHISPER_DEVICE: {{ .Values.whisper.device | quote }}
   WHISPER_DEFAULT_LANGUAGE: {{ .Values.whisper.defaultLanguage | quote }}
   WHISPER_MAX_UPLOAD_SIZE_MB: {{ .Values.whisper.maxUploadSizeMb | quote }}

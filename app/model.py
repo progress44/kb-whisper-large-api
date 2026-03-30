@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import gc
 import threading
+from collections import OrderedDict
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
 
@@ -13,6 +16,18 @@ from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 from app.config import Config
 
 
+class ModelLoadError(RuntimeError):
+    """Raised when a model id cannot be loaded for transcription."""
+
+
+@dataclass
+class LoadedModel:
+    model_id: str
+    model: Any
+    processor: Any
+    infer_lock: threading.Lock
+
+
 @dataclass
 class ModelStatus:
     initialized: bool
@@ -20,15 +35,17 @@ class ModelStatus:
     model_id: str
     device: str
     error: str | None
+    loaded_model_count: int
+    max_models_in_memory: int
+    loaded_models: list[str]
 
 
-class WhisperModel:
+class WhisperModelManager:
     def __init__(self) -> None:
-        self._model: Any | None = None
-        self._processor: Any | None = None
-        self._init_lock = threading.Lock()
-        self._infer_lock = threading.Lock()
-        self._initializing = False
+        self._cache: OrderedDict[str, LoadedModel] = OrderedDict()
+        self._cache_lock = threading.Lock()
+        self._model_load_locks: dict[str, threading.Lock] = {}
+        self._loading_models = 0
         self._error: str | None = None
         self._resolved_device = self._resolve_device()
 
@@ -51,64 +68,129 @@ class WhisperModel:
     def _device(self) -> torch.device:
         return torch.device(self._resolved_device)
 
-    def initialize(self) -> None:
-        if self._model is not None and self._processor is not None:
-            return
+    def _clear_device_cache(self) -> None:
+        if self._resolved_device == "cuda" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-        with self._init_lock:
-            if self._model is not None and self._processor is not None:
-                return
+    def _set_error(self, message: str) -> None:
+        with self._cache_lock:
+            self._error = message
 
-            self._initializing = True
-            self._error = None
-            try:
-                self._processor = AutoProcessor.from_pretrained(Config.MODEL_ID)
-                self._model = AutoModelForSpeechSeq2Seq.from_pretrained(
-                    Config.MODEL_ID,
-                    torch_dtype=self._torch_dtype(),
-                    low_cpu_mem_usage=True,
-                    use_safetensors=True,
-                )
-                self._model.to(self._device())
-                self._model.eval()
-            except Exception as exc:  # noqa: BLE001
-                self._error = str(exc)
-                raise
-            finally:
-                self._initializing = False
+    def _set_loading(self, loading: bool) -> None:
+        with self._cache_lock:
+            if loading:
+                self._loading_models += 1
+            else:
+                self._loading_models = max(0, self._loading_models - 1)
 
-    def status(self) -> ModelStatus:
-        return ModelStatus(
-            initialized=self._model is not None and self._processor is not None,
-            initializing=self._initializing,
-            model_id=Config.MODEL_ID,
-            device=self._resolved_device,
-            error=self._error,
+    def _load_bundle(self, model_id: str) -> LoadedModel:
+        processor = AutoProcessor.from_pretrained(model_id)
+        model = AutoModelForSpeechSeq2Seq.from_pretrained(
+            model_id,
+            torch_dtype=self._torch_dtype(),
+            low_cpu_mem_usage=True,
+            use_safetensors=True,
+        )
+        model.to(self._device())
+        model.eval()
+        return LoadedModel(
+            model_id=model_id,
+            model=model,
+            processor=processor,
+            infer_lock=threading.Lock(),
         )
 
-    def _load_audio(self, audio_path: str) -> tuple[torch.Tensor, int]:
-        if self._processor is None:
-            raise RuntimeError("Whisper processor is not initialized")
+    def _dispose_bundle(self, bundle: LoadedModel) -> None:
+        with suppress(Exception):
+            if hasattr(bundle.model, "to"):
+                bundle.model.to("cpu")
 
+        del bundle.model
+        del bundle.processor
+        gc.collect()
+        self._clear_device_cache()
+
+    def _get_or_load_model(self, model_id: str) -> LoadedModel:
+        with self._cache_lock:
+            cached = self._cache.get(model_id)
+            if cached is not None:
+                self._cache.move_to_end(model_id)
+                return cached
+            load_lock = self._model_load_locks.setdefault(model_id, threading.Lock())
+
+        with load_lock:
+            with self._cache_lock:
+                cached = self._cache.get(model_id)
+                if cached is not None:
+                    self._cache.move_to_end(model_id)
+                    return cached
+
+            self._set_loading(True)
+            try:
+                bundle = self._load_bundle(model_id)
+                self._set_error("")
+            except Exception as exc:  # noqa: BLE001
+                message = f"Unable to load model '{model_id}': {exc}"
+                self._set_error(message)
+                with self._cache_lock:
+                    self._model_load_locks.pop(model_id, None)
+                raise ModelLoadError(message) from exc
+            finally:
+                self._set_loading(False)
+
+            evicted: list[LoadedModel] = []
+            with self._cache_lock:
+                self._cache[model_id] = bundle
+                self._cache.move_to_end(model_id)
+                while len(self._cache) > Config.MAX_MODELS_IN_MEMORY:
+                    _, old_bundle = self._cache.popitem(last=False)
+                    evicted.append(old_bundle)
+                self._model_load_locks.pop(model_id, None)
+
+            for old_bundle in evicted:
+                self._dispose_bundle(old_bundle)
+
+            return bundle
+
+    def initialize(self) -> None:
+        # Keeps backward compatibility with startup warm-up flows.
+        self._get_or_load_model(Config.MODEL_ID)
+
+    def loaded_model_ids(self) -> list[str]:
+        with self._cache_lock:
+            return list(self._cache.keys())
+
+    def status(self) -> ModelStatus:
+        with self._cache_lock:
+            loaded_models = list(self._cache.keys())
+            return ModelStatus(
+                initialized=bool(loaded_models),
+                initializing=self._loading_models > 0,
+                model_id=Config.MODEL_ID,
+                device=self._resolved_device,
+                error=self._error or None,
+                loaded_model_count=len(loaded_models),
+                max_models_in_memory=Config.MAX_MODELS_IN_MEMORY,
+                loaded_models=loaded_models,
+            )
+
+    def _load_audio(self, audio_path: str, processor: Any) -> tuple[torch.Tensor, int]:
         audio, sample_rate = torchaudio.load(audio_path)
         if audio.ndim == 2 and audio.size(0) > 1:
             audio = audio.mean(dim=0, keepdim=True)
         audio = audio.squeeze(0)
 
-        target_sample_rate = self._processor.feature_extractor.sampling_rate
+        target_sample_rate = processor.feature_extractor.sampling_rate
         if sample_rate != target_sample_rate:
             audio = torchaudio.functional.resample(audio, sample_rate, target_sample_rate)
             sample_rate = target_sample_rate
 
         return audio.cpu(), sample_rate
 
-    def _prompt_ids(self, prompt: str) -> torch.Tensor | None:
-        if self._processor is None:
-            return None
-
-        getter = getattr(self._processor, "get_prompt_ids", None)
-        if getter is None and hasattr(self._processor, "tokenizer"):
-            getter = getattr(self._processor.tokenizer, "get_prompt_ids", None)
+    def _prompt_ids(self, processor: Any, prompt: str) -> torch.Tensor | None:
+        getter = getattr(processor, "get_prompt_ids", None)
+        if getter is None and hasattr(processor, "tokenizer"):
+            getter = getattr(processor.tokenizer, "get_prompt_ids", None)
         if getter is None:
             return None
 
@@ -122,31 +204,26 @@ class WhisperModel:
 
         return torch.as_tensor(prompt_ids, dtype=torch.long).reshape(-1)
 
-    def _decode(self, generated: Any) -> str:
-        if self._processor is None:
-            raise RuntimeError("Whisper processor is not initialized")
-
+    def _decode(self, processor: Any, generated: Any) -> str:
         sequences = generated.get("sequences") if isinstance(generated, dict) else generated
         if sequences is None:
             raise RuntimeError("Whisper generate() returned no sequences")
 
-        decoded = self._processor.batch_decode(sequences, skip_special_tokens=True)
+        decoded = processor.batch_decode(sequences, skip_special_tokens=True)
         return decoded[0].strip() if decoded else ""
 
     def transcribe(
         self,
+        model_id: str,
         audio_path: str,
         language: str | None,
         prompt: str | None,
         temperature: float | None,
     ) -> str:
-        self.initialize()
+        bundle = self._get_or_load_model(model_id)
 
-        if self._model is None or self._processor is None:
-            raise RuntimeError("Whisper model is not initialized")
-
-        audio, sample_rate = self._load_audio(audio_path)
-        inputs = self._processor(
+        audio, sample_rate = self._load_audio(audio_path, bundle.processor)
+        inputs = bundle.processor(
             audio.numpy(),
             sampling_rate=sample_rate,
             return_tensors="pt",
@@ -170,7 +247,7 @@ class WhisperModel:
             generate_kwargs["language"] = Config.DEFAULT_LANGUAGE
 
         if prompt:
-            prompt_ids = self._prompt_ids(prompt)
+            prompt_ids = self._prompt_ids(bundle.processor, prompt)
             if prompt_ids is not None:
                 generate_kwargs["prompt_ids"] = prompt_ids.to(device)
 
@@ -179,17 +256,16 @@ class WhisperModel:
             if temperature > 0:
                 generate_kwargs["do_sample"] = True
 
-        with self._infer_lock:
+        with bundle.infer_lock:
             try:
                 with torch.inference_mode():
-                    generated = self._model.generate(**model_inputs, **generate_kwargs)
-                self._error = None
-                return self._decode(generated)
+                    generated = bundle.model.generate(**model_inputs, **generate_kwargs)
+                self._set_error("")
+                return self._decode(bundle.processor, generated)
             except Exception as exc:  # noqa: BLE001
-                self._error = str(exc)
-                if self._resolved_device == "cuda" and torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                self._set_error(str(exc))
+                self._clear_device_cache()
                 raise
 
 
-whisper_model = WhisperModel()
+whisper_model = WhisperModelManager()

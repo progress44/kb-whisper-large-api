@@ -8,6 +8,7 @@ service:
 
 whisper:
   modelId: KBLab/kb-whisper-large
+  maxModelsInMemory: "2"
   device: cuda
   defaultLanguage: sv
   maxUploadSizeMb: "200"
