@@ -125,14 +125,25 @@ async def _transcribe_upload(
 ) -> str:
     tmp_path = await _save_upload(file)
     try:
-        text = await asyncio.to_thread(
-            whisper_model.transcribe,
-            tmp_path,
-            _final_language(language),
-            prompt,
-            temperature,
-        )
-        return text
+        try:
+            text = await asyncio.to_thread(
+                whisper_model.transcribe,
+                tmp_path,
+                _final_language(language),
+                prompt,
+                temperature,
+            )
+            return text
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "error": {
+                        "type": "transcription_unavailable",
+                        "message": str(exc),
+                    }
+                },
+            ) from exc
     finally:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
