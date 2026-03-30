@@ -212,6 +212,14 @@ class WhisperModelManager:
         decoded = processor.batch_decode(sequences, skip_special_tokens=True)
         return decoded[0].strip() if decoded else ""
 
+    def _model_compute_dtype(self, model: Any) -> torch.dtype:
+        """Resolve runtime model dtype, falling back to configured default."""
+        with suppress(Exception):
+            parameter = next(model.parameters())
+            if isinstance(parameter, torch.Tensor):
+                return parameter.dtype
+        return self._torch_dtype()
+
     def transcribe(
         self,
         model_id: str,
@@ -232,7 +240,11 @@ class WhisperModelManager:
         )
 
         device = self._device()
-        model_inputs: dict[str, Any] = {"input_features": inputs["input_features"].to(device)}
+        model_dtype = self._model_compute_dtype(bundle.model)
+        # Keep input features aligned with model dtype to avoid float32/float16 mismatch on CUDA.
+        model_inputs: dict[str, Any] = {
+            "input_features": inputs["input_features"].to(device=device, dtype=model_dtype)
+        }
         attention_mask = inputs.get("attention_mask")
         if attention_mask is not None:
             model_inputs["attention_mask"] = attention_mask.to(device)

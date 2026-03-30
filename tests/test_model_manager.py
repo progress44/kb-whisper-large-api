@@ -5,6 +5,8 @@ import time
 import unittest
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from app.model import LoadedModel, WhisperModelManager
 
 
@@ -15,6 +17,50 @@ def make_bundle(model_id: str) -> LoadedModel:
         model_id=model_id,
         model=model,
         processor=processor,
+        infer_lock=threading.Lock(),
+    )
+
+
+class _FakeFeatureExtractor:
+    sampling_rate = 16000
+
+
+class _FakeProcessor:
+    def __init__(self) -> None:
+        self.feature_extractor = _FakeFeatureExtractor()
+        self.tokenizer = self
+
+    def __call__(self, *_args, **_kwargs):
+        return {
+            "input_features": torch.randn(1, 80, 300, dtype=torch.float32),
+            "attention_mask": torch.ones(1, 300, dtype=torch.long),
+        }
+
+    def batch_decode(self, _sequences, skip_special_tokens=True):  # noqa: ARG002
+        return ["hej varlden"]
+
+    def get_prompt_ids(self, _prompt, return_tensors="pt"):  # noqa: ARG002
+        return torch.tensor([10, 11, 12], dtype=torch.long)
+
+
+class _FakeModel:
+    def __init__(self, dtype: torch.dtype) -> None:
+        self._param = torch.zeros(1, dtype=dtype)
+        self.last_generate_kwargs = None
+
+    def parameters(self):
+        return iter([self._param])
+
+    def generate(self, **kwargs):
+        self.last_generate_kwargs = kwargs
+        return torch.tensor([[1, 2, 3]], dtype=torch.long)
+
+
+def make_transcribe_bundle(model_id: str, model_dtype: torch.dtype) -> LoadedModel:
+    return LoadedModel(
+        model_id=model_id,
+        model=_FakeModel(model_dtype),
+        processor=_FakeProcessor(),
         infer_lock=threading.Lock(),
     )
 
@@ -81,6 +127,58 @@ class WhisperModelManagerTests(unittest.TestCase):
         self.assertTrue(results)
         first = results[0]
         self.assertTrue(all(bundle is first for bundle in results))
+
+    def test_transcribe_casts_input_features_to_float16_when_model_is_float16(self) -> None:
+        manager = WhisperModelManager()
+        bundle = make_transcribe_bundle("m1", torch.float16)
+
+        with patch.object(manager, "_get_or_load_model", return_value=bundle):
+            with patch.object(manager, "_device", return_value=torch.device("cpu")):
+                with patch.object(
+                    manager,
+                    "_load_audio",
+                    return_value=(torch.randn(16000, dtype=torch.float32), 16000),
+                ):
+                    text = manager.transcribe("m1", "/tmp/audio.wav", "sv", None, None)
+
+        self.assertEqual(text, "hej varlden")
+        self.assertIsNotNone(bundle.model.last_generate_kwargs)
+        self.assertEqual(bundle.model.last_generate_kwargs["input_features"].dtype, torch.float16)
+
+    def test_transcribe_keeps_input_features_float32_when_model_is_float32(self) -> None:
+        manager = WhisperModelManager()
+        bundle = make_transcribe_bundle("m1", torch.float32)
+
+        with patch.object(manager, "_get_or_load_model", return_value=bundle):
+            with patch.object(manager, "_device", return_value=torch.device("cpu")):
+                with patch.object(
+                    manager,
+                    "_load_audio",
+                    return_value=(torch.randn(16000, dtype=torch.float32), 16000),
+                ):
+                    manager.transcribe("m1", "/tmp/audio.wav", "sv", None, None)
+
+        self.assertIsNotNone(bundle.model.last_generate_kwargs)
+        self.assertEqual(bundle.model.last_generate_kwargs["input_features"].dtype, torch.float32)
+
+    def test_transcribe_keeps_attention_mask_and_prompt_ids_integer_dtypes(self) -> None:
+        manager = WhisperModelManager()
+        bundle = make_transcribe_bundle("m1", torch.float16)
+
+        with patch.object(manager, "_get_or_load_model", return_value=bundle):
+            with patch.object(manager, "_device", return_value=torch.device("cpu")):
+                with patch.object(
+                    manager,
+                    "_load_audio",
+                    return_value=(torch.randn(16000, dtype=torch.float32), 16000),
+                ):
+                    manager.transcribe("m1", "/tmp/audio.wav", "sv", "ledtext", None)
+
+        self.assertIsNotNone(bundle.model.last_generate_kwargs)
+        attention_mask = bundle.model.last_generate_kwargs["attention_mask"]
+        prompt_ids = bundle.model.last_generate_kwargs["prompt_ids"]
+        self.assertIn(attention_mask.dtype, (torch.long, torch.int64, torch.bool))
+        self.assertEqual(prompt_ids.dtype, torch.long)
 
 
 if __name__ == "__main__":
