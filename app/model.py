@@ -268,6 +268,8 @@ class WhisperModelManager:
             if temperature > 0:
                 generate_kwargs["do_sample"] = True
 
+        del inputs, audio  # Free CPU tensors before inference
+
         with bundle.infer_lock:
             try:
                 with torch.inference_mode():
@@ -276,8 +278,14 @@ class WhisperModelManager:
                 return self._decode(bundle.processor, generated)
             except Exception as exc:  # noqa: BLE001
                 self._set_error(str(exc))
-                self._clear_device_cache()
                 raise
+            finally:
+                # Free intermediate tensors and device memory after every inference
+                del model_inputs
+                if "prompt_ids" in generate_kwargs:
+                    del generate_kwargs["prompt_ids"]
+                gc.collect()
+                self._clear_device_cache()
 
 
 whisper_model = WhisperModelManager()
