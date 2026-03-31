@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import gc
+import re
 import threading
+import time
 from collections import OrderedDict
 from contextlib import suppress
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Generator
 
 import torch
 import torchaudio
@@ -15,9 +17,24 @@ from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 
 from app.config import Config
 
+_TIMESTAMP_RE = re.compile(r"<\|(\d+\.\d+)\|>")
+
 
 class ModelLoadError(RuntimeError):
     """Raised when a model id cannot be loaded for transcription."""
+
+
+@dataclass
+class TranscriptionSegment:
+    start: float
+    end: float
+    text: str
+
+
+@dataclass
+class TranscriptionResult:
+    text: str
+    segments: list[TranscriptionSegment] = field(default_factory=list)
 
 
 @dataclass
@@ -40,6 +57,15 @@ class ModelStatus:
     loaded_models: list[str]
 
 
+@dataclass
+class Metrics:
+    transcriptions_total: int
+    translations_total: int
+    inference_seconds_total: float
+    errors_total: int
+    active_inferences: int
+
+
 class WhisperModelManager:
     def __init__(self) -> None:
         self._cache: OrderedDict[str, LoadedModel] = OrderedDict()
@@ -48,6 +74,13 @@ class WhisperModelManager:
         self._loading_models = 0
         self._error: str | None = None
         self._resolved_device = self._resolve_device()
+        # Metrics
+        self._metrics_lock = threading.Lock()
+        self._transcription_count = 0
+        self._translation_count = 0
+        self._inference_seconds = 0.0
+        self._error_count = 0
+        self._active_inferences = 0
 
     def _resolve_device(self) -> str:
         configured = Config.DEVICE.lower()
@@ -174,6 +207,36 @@ class WhisperModelManager:
                 loaded_models=loaded_models,
             )
 
+    def metrics(self) -> Metrics:
+        with self._metrics_lock:
+            return Metrics(
+                transcriptions_total=self._transcription_count,
+                translations_total=self._translation_count,
+                inference_seconds_total=self._inference_seconds,
+                errors_total=self._error_count,
+                active_inferences=self._active_inferences,
+            )
+
+    def load_model(self, model_id: str) -> None:
+        self._get_or_load_model(model_id)
+
+    def unload_model(self, model_id: str) -> bool:
+        with self._cache_lock:
+            bundle = self._cache.pop(model_id, None)
+        if bundle is not None:
+            self._dispose_bundle(bundle)
+            return True
+        return False
+
+    def supported_languages(self, model_id: str) -> list[str]:
+        bundle = self._get_or_load_model(model_id)
+        tokenizer = bundle.processor.tokenizer
+        langs = []
+        for token in getattr(tokenizer, "additional_special_tokens", []):
+            if token.startswith("<|") and token.endswith("|>") and len(token) == 6:
+                langs.append(token[2:-2])
+        return sorted(langs)
+
     def _load_audio(self, audio_path: str, processor: Any) -> tuple[torch.Tensor, int]:
         audio, sample_rate = torchaudio.load(audio_path)
         if audio.ndim == 2 and audio.size(0) > 1:
@@ -204,13 +267,20 @@ class WhisperModelManager:
 
         return torch.as_tensor(prompt_ids, dtype=torch.long).reshape(-1)
 
-    def _decode(self, processor: Any, generated: Any) -> str:
-        sequences = generated.get("sequences") if isinstance(generated, dict) else generated
-        if sequences is None:
-            raise RuntimeError("Whisper generate() returned no sequences")
-
-        decoded = processor.batch_decode(sequences, skip_special_tokens=True)
-        return decoded[0].strip() if decoded else ""
+    def _parse_segments(self, raw: str) -> list[TranscriptionSegment]:
+        matches = list(_TIMESTAMP_RE.finditer(raw))
+        segments = []
+        i = 0
+        while i < len(matches) - 1:
+            start = float(matches[i].group(1))
+            end = float(matches[i + 1].group(1))
+            text = raw[matches[i].end() : matches[i + 1].start()].strip()
+            if text:
+                segments.append(TranscriptionSegment(start=start, end=end, text=text))
+                i += 2
+            else:
+                i += 1
+        return segments
 
     def _model_compute_dtype(self, model: Any) -> torch.dtype:
         """Resolve runtime model dtype, falling back to configured default."""
@@ -220,17 +290,17 @@ class WhisperModelManager:
                 return parameter.dtype
         return self._torch_dtype()
 
-    def transcribe(
+    def _transcribe_tensor(
         self,
-        model_id: str,
-        audio_path: str,
+        bundle: LoadedModel,
+        audio: torch.Tensor,
+        sample_rate: int,
         language: str | None,
         prompt: str | None,
         temperature: float | None,
-    ) -> str:
-        bundle = self._get_or_load_model(model_id)
-
-        audio, sample_rate = self._load_audio(audio_path, bundle.processor)
+        task: str = "transcribe",
+        time_offset: float = 0.0,
+    ) -> TranscriptionResult:
         inputs = bundle.processor(
             audio.numpy(),
             sampling_rate=sample_rate,
@@ -241,7 +311,6 @@ class WhisperModelManager:
 
         device = self._device()
         model_dtype = self._model_compute_dtype(bundle.model)
-        # Keep input features aligned with model dtype to avoid float32/float16 mismatch on CUDA.
         model_inputs: dict[str, Any] = {
             "input_features": inputs["input_features"].to(device=device, dtype=model_dtype)
         }
@@ -250,7 +319,7 @@ class WhisperModelManager:
             model_inputs["attention_mask"] = attention_mask.to(device)
 
         generate_kwargs: dict[str, Any] = {
-            "task": "transcribe",
+            "task": task,
             "return_timestamps": True,
         }
         if language:
@@ -275,17 +344,123 @@ class WhisperModelManager:
                 with torch.inference_mode():
                     generated = bundle.model.generate(**model_inputs, **generate_kwargs)
                 self._set_error("")
-                return self._decode(bundle.processor, generated)
+
+                sequences = generated.get("sequences") if isinstance(generated, dict) else generated
+                if sequences is None:
+                    raise RuntimeError("Whisper generate() returned no sequences")
+
+                text = bundle.processor.batch_decode(sequences, skip_special_tokens=True)
+                text = text[0].strip() if text else ""
+
+                # Parse timestamped segments
+                segments: list[TranscriptionSegment] = []
+                with suppress(Exception):
+                    raw = bundle.processor.tokenizer.decode(
+                        sequences[0], skip_special_tokens=False, decode_with_timestamps=True
+                    )
+                    segments = self._parse_segments(raw)
+                    if time_offset > 0:
+                        segments = [
+                            TranscriptionSegment(s.start + time_offset, s.end + time_offset, s.text)
+                            for s in segments
+                        ]
+
+                return TranscriptionResult(text=text, segments=segments)
             except Exception as exc:  # noqa: BLE001
                 self._set_error(str(exc))
                 raise
             finally:
-                # Free intermediate tensors and device memory after every inference
                 del model_inputs
                 if "prompt_ids" in generate_kwargs:
                     del generate_kwargs["prompt_ids"]
                 gc.collect()
                 self._clear_device_cache()
+
+    def transcribe(
+        self,
+        model_id: str,
+        audio_path: str,
+        language: str | None,
+        prompt: str | None,
+        temperature: float | None,
+        task: str = "transcribe",
+    ) -> TranscriptionResult:
+        bundle = self._get_or_load_model(model_id)
+        audio, sample_rate = self._load_audio(audio_path, bundle.processor)
+
+        with self._metrics_lock:
+            self._active_inferences += 1
+
+        t0 = time.monotonic()
+        try:
+            result = self._transcribe_tensor(
+                bundle, audio, sample_rate, language, prompt, temperature, task
+            )
+            with self._metrics_lock:
+                if task == "translate":
+                    self._translation_count += 1
+                else:
+                    self._transcription_count += 1
+                self._inference_seconds += time.monotonic() - t0
+            return result
+        except Exception:
+            with self._metrics_lock:
+                self._error_count += 1
+                self._inference_seconds += time.monotonic() - t0
+            raise
+        finally:
+            with self._metrics_lock:
+                self._active_inferences -= 1
+
+    def transcribe_chunks(
+        self,
+        model_id: str,
+        audio_path: str,
+        language: str | None,
+        prompt: str | None,
+        temperature: float | None,
+        task: str = "transcribe",
+    ) -> Generator[TranscriptionResult, None, None]:
+        """Yield a TranscriptionResult per ~30 s audio chunk for streaming."""
+        bundle = self._get_or_load_model(model_id)
+        audio, sample_rate = self._load_audio(audio_path, bundle.processor)
+
+        chunk_duration = 30  # seconds
+        chunk_samples = chunk_duration * sample_rate
+        total_samples = audio.shape[0]
+
+        if total_samples <= chunk_samples:
+            yield self.transcribe(model_id, audio_path, language, prompt, temperature, task)
+            return
+
+        with self._metrics_lock:
+            self._active_inferences += 1
+
+        t0 = time.monotonic()
+        try:
+            for start in range(0, total_samples, chunk_samples):
+                end = min(start + chunk_samples, total_samples)
+                chunk = audio[start:end]
+                time_offset = start / sample_rate
+                result = self._transcribe_tensor(
+                    bundle, chunk, sample_rate, language, prompt, temperature, task, time_offset
+                )
+                yield result
+
+            with self._metrics_lock:
+                if task == "translate":
+                    self._translation_count += 1
+                else:
+                    self._transcription_count += 1
+                self._inference_seconds += time.monotonic() - t0
+        except Exception:
+            with self._metrics_lock:
+                self._error_count += 1
+                self._inference_seconds += time.monotonic() - t0
+            raise
+        finally:
+            with self._metrics_lock:
+                self._active_inferences -= 1
 
 
 whisper_model = WhisperModelManager()

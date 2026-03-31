@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from app.model import LoadedModel, WhisperModelManager
+from app.model import LoadedModel, TranscriptionResult, WhisperModelManager
 
 
 def make_bundle(model_id: str) -> LoadedModel:
@@ -21,6 +21,18 @@ def make_bundle(model_id: str) -> LoadedModel:
     )
 
 
+class _FakeTokenizer:
+    additional_special_tokens = ["<|en|>", "<|sv|>", "<|notranslate|>"]
+
+    def decode(self, _sequence, skip_special_tokens=True, decode_with_timestamps=False):  # noqa: ARG002
+        if decode_with_timestamps:
+            return "<|0.00|> hej varlden<|2.50|>"
+        return "hej varlden"
+
+    def get_prompt_ids(self, _prompt, return_tensors="pt"):  # noqa: ARG002
+        return torch.tensor([10, 11, 12], dtype=torch.long)
+
+
 class _FakeFeatureExtractor:
     sampling_rate = 16000
 
@@ -28,7 +40,7 @@ class _FakeFeatureExtractor:
 class _FakeProcessor:
     def __init__(self) -> None:
         self.feature_extractor = _FakeFeatureExtractor()
-        self.tokenizer = self
+        self.tokenizer = _FakeTokenizer()
 
     def __call__(self, *_args, **_kwargs):
         return {
@@ -128,6 +140,22 @@ class WhisperModelManagerTests(unittest.TestCase):
         first = results[0]
         self.assertTrue(all(bundle is first for bundle in results))
 
+    def test_transcribe_returns_result_with_text(self) -> None:
+        manager = WhisperModelManager()
+        bundle = make_transcribe_bundle("m1", torch.float16)
+
+        with patch.object(manager, "_get_or_load_model", return_value=bundle):
+            with patch.object(manager, "_device", return_value=torch.device("cpu")):
+                with patch.object(
+                    manager,
+                    "_load_audio",
+                    return_value=(torch.randn(16000, dtype=torch.float32), 16000),
+                ):
+                    result = manager.transcribe("m1", "/tmp/audio.wav", "sv", None, None)
+
+        self.assertIsInstance(result, TranscriptionResult)
+        self.assertEqual(result.text, "hej varlden")
+
     def test_transcribe_casts_input_features_to_float16_when_model_is_float16(self) -> None:
         manager = WhisperModelManager()
         bundle = make_transcribe_bundle("m1", torch.float16)
@@ -139,9 +167,8 @@ class WhisperModelManagerTests(unittest.TestCase):
                     "_load_audio",
                     return_value=(torch.randn(16000, dtype=torch.float32), 16000),
                 ):
-                    text = manager.transcribe("m1", "/tmp/audio.wav", "sv", None, None)
+                    manager.transcribe("m1", "/tmp/audio.wav", "sv", None, None)
 
-        self.assertEqual(text, "hej varlden")
         self.assertIsNotNone(bundle.model.last_generate_kwargs)
         self.assertEqual(bundle.model.last_generate_kwargs["input_features"].dtype, torch.float16)
 
@@ -179,6 +206,75 @@ class WhisperModelManagerTests(unittest.TestCase):
         prompt_ids = bundle.model.last_generate_kwargs["prompt_ids"]
         self.assertIn(attention_mask.dtype, (torch.long, torch.int64, torch.bool))
         self.assertEqual(prompt_ids.dtype, torch.long)
+
+    def test_transcribe_with_translate_task(self) -> None:
+        manager = WhisperModelManager()
+        bundle = make_transcribe_bundle("m1", torch.float32)
+
+        with patch.object(manager, "_get_or_load_model", return_value=bundle):
+            with patch.object(manager, "_device", return_value=torch.device("cpu")):
+                with patch.object(
+                    manager,
+                    "_load_audio",
+                    return_value=(torch.randn(16000, dtype=torch.float32), 16000),
+                ):
+                    manager.transcribe("m1", "/tmp/audio.wav", "sv", None, None, task="translate")
+
+        self.assertEqual(bundle.model.last_generate_kwargs["task"], "translate")
+
+    def test_unload_model(self) -> None:
+        manager = WhisperModelManager()
+        with patch("app.model.Config.MAX_MODELS_IN_MEMORY", 2):
+            with patch.object(manager, "_load_bundle", return_value=make_bundle("m1")):
+                manager._get_or_load_model("m1")
+
+        with patch.object(manager, "_dispose_bundle"):
+            self.assertTrue(manager.unload_model("m1"))
+            self.assertFalse(manager.unload_model("m1"))
+
+        self.assertEqual(manager.loaded_model_ids(), [])
+
+    def test_metrics_tracks_transcriptions(self) -> None:
+        manager = WhisperModelManager()
+        bundle = make_transcribe_bundle("m1", torch.float32)
+
+        with patch.object(manager, "_get_or_load_model", return_value=bundle):
+            with patch.object(manager, "_device", return_value=torch.device("cpu")):
+                with patch.object(
+                    manager,
+                    "_load_audio",
+                    return_value=(torch.randn(16000, dtype=torch.float32), 16000),
+                ):
+                    manager.transcribe("m1", "/tmp/audio.wav", "sv", None, None)
+                    manager.transcribe("m1", "/tmp/audio.wav", "sv", None, None, task="translate")
+
+        m = manager.metrics()
+        self.assertEqual(m.transcriptions_total, 1)
+        self.assertEqual(m.translations_total, 1)
+        self.assertGreater(m.inference_seconds_total, 0)
+        self.assertEqual(m.active_inferences, 0)
+
+    def test_supported_languages(self) -> None:
+        manager = WhisperModelManager()
+        bundle = make_transcribe_bundle("m1", torch.float32)
+
+        with patch.object(manager, "_get_or_load_model", return_value=bundle):
+            langs = manager.supported_languages("m1")
+
+        self.assertEqual(langs, ["en", "sv"])
+
+    def test_parse_segments(self) -> None:
+        manager = WhisperModelManager()
+        raw = "<|0.00|> Hello world.<|3.20|><|3.20|> How are you?<|5.40|>"
+        segments = manager._parse_segments(raw)
+
+        self.assertEqual(len(segments), 2)
+        self.assertAlmostEqual(segments[0].start, 0.0)
+        self.assertAlmostEqual(segments[0].end, 3.2)
+        self.assertEqual(segments[0].text, "Hello world.")
+        self.assertAlmostEqual(segments[1].start, 3.2)
+        self.assertAlmostEqual(segments[1].end, 5.4)
+        self.assertEqual(segments[1].text, "How are you?")
 
 
 if __name__ == "__main__":
