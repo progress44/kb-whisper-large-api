@@ -27,7 +27,7 @@ def _docs_url(path: str) -> str | None:
 app = FastAPI(
     title="KB Whisper Large API",
     description="OpenAI-compatible transcription API powered by Hugging Face Whisper models",
-    version="1.6.0",
+    version="1.7.0",
     docs_url=_docs_url("/docs"),
     redoc_url=_docs_url("/redoc"),
     lifespan=lifespan,
