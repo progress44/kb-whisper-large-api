@@ -1,5 +1,6 @@
 olaresManifest.version: "0.11.0"
 olaresManifest.type: app
+apiVersion: "v2"
 metadata:
   name: kbwhisperlarge
   description: Private transcription API powered by Hugging Face Whisper models.
@@ -11,16 +12,43 @@ metadata:
     - AI
     - Utilities
     - Developer Tools
+sharedEntrances:
+  - name: kbwhisperlarge
+    port: 0
+    host: sharedentrances-api
+    title: KB Whisper Large API
+    icon: https://huggingface.co/front/assets/huggingface_logo-noborder.svg
+    invisible: true
+    authLevel: internal
+entrances:
+  - name: kbwhisperlarge
+    port: 8080
+    host: kbwhisperlarge-svc
+    title: KB Whisper Large API
+    icon: https://huggingface.co/front/assets/huggingface_logo-noborder.svg
+    authLevel: internal
+    openMethod: window
 permission:
   appData: true
   appCache: true
+{{- if and .Values.admin .Values.bfl.username (eq .Values.admin .Values.bfl.username) }}
   userData:
     - Home
+{{- end }}
 spec:
   versionName: "gpu-cu128"
   fullDescription: |
-    KB Whisper Large exposes a transcription API on Olares using Whisper-compatible
-    Hugging Face model IDs selected per request.
+    KB Whisper Large is a shared Olares transcription API. The administrator
+    installs one GPU-backed service for the cluster, while each installed user
+    receives a lightweight user-space API entrance that proxies to the shared
+    backend.
+
+    Access
+    - User endpoint: `https://kbwhisperlarge.<OlaresID>.olares.com`
+      - Use this endpoint from browsers, user tools, or workflows that need a
+        normal user-space Olares route.
+    - Shared endpoint: `http://kbwhisperlarge.shared.olares.com`
+      - Use this internal endpoint for cluster app-to-app API calls.
 
     Endpoints
     - `GET /`
@@ -42,13 +70,13 @@ spec:
       - Simple alias that returns `{ "text": "..." }`.
 
     Example request
-    - `curl -X POST http://kbwhisperlarge-svc:8000/v1/audio/transcriptions -F "model=openai/whisper-large-v3" -F "file=@./sample.wav" -F "language=en"`
+    - `curl -X POST https://kbwhisperlarge.<OlaresID>.olares.com/v1/audio/transcriptions -F "model=openai/whisper-large-v3" -F "file=@./sample.wav" -F "language=en"`
 
     Notes
     - First request for each model may be slow while model weights are pulled into app data.
     - If `model` is omitted, default model `WHISPER_MODEL_ID` is used.
     - Active models are cached in-memory with LRU eviction (size configured by `WHISPER_MAX_MODELS_IN_MEMORY`).
-    - Hugging Face cache is persisted at `userspace.appData/huggingface`.
+    - Hugging Face cache is persisted in the administrator shared service app data.
     - This package targets `amd64` Olares nodes with NVIDIA GPU support.
   developer: progress44
   website: https://huggingface.co/KBLab/kb-whisper-large
@@ -60,6 +88,7 @@ spec:
       url: https://huggingface.co/KBLab/kb-whisper-large
   locale:
     - en-US
+  {{- if and .Values.admin .Values.bfl.username (eq .Values.admin .Values.bfl.username) }}
   requiredMemory: 12Gi
   limitedMemory: 12Gi
   requiredDisk: 5Gi
@@ -68,14 +97,42 @@ spec:
   limitedCpu: 4
   requiredGpu: 12Gi
   limitedGpu: 16Gi
+  {{- else }}
+  requiredMemory: 64Mi
+  limitedMemory: 256Mi
+  requiredDisk: 1Mi
+  limitedDisk: 100Mi
+  requiredCpu: 10m
+  limitedCpu: 100m
+  {{- end }}
   supportArch:
     - amd64
+  subCharts:
+    - name: kbwhisperlargeserver
+      shared: true
+    - name: kbwhisperlarge
 options:
   apiTimeout: 0
   dependencies:
     - name: olares
       type: system
-      version: ">=1.12.1-0"
+      version: ">=1.12.3-0"
+  {{- if and .Values.admin .Values.bfl.username (eq .Values.admin .Values.bfl.username) }}
+  {{- else }}
+    - name: kbwhisperlarge
+      type: application
+      version: ">=1.3.0"
+      mandatory: true
+  {{- end }}
+  appScope:
+  {{- if and .Values.admin .Values.bfl.username (eq .Values.admin .Values.bfl.username) }}
+    clusterScoped: true
+    appRef:
+      - kbwhisperlarge
+  {{- else }}
+    clusterScoped: false
+  {{- end }}
+{{- if and .Values.admin .Values.bfl.username (eq .Values.admin .Values.bfl.username) }}
 envs:
   - envName: OLARES_USER_HUGGINGFACE_TOKEN
     required: false
@@ -87,11 +144,4 @@ envs:
     applyOnChange: true
     valueFrom:
       envName: OLARES_USER_HUGGINGFACE_SERVICE
-entrances:
-  - name: kbwhisperlarge
-    port: 8000
-    host: kbwhisperlarge-svc
-    title: KB Whisper Large
-    icon: https://huggingface.co/front/assets/huggingface_logo-noborder.svg
-    authLevel: internal
-    openMethod: window
+{{- end }}

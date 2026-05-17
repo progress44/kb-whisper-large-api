@@ -1,0 +1,5 @@
+proxy:
+  image: docker.io/beclab/aboveos-bitnami-openresty:1.25.3-2
+  sharedBackend: sharedentrances-api.kbwhisperlargeserver-shared
+  sharedBackendPort: 80
+  port: 8080
