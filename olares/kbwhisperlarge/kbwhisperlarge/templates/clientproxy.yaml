@@ -1,0 +1,118 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kbwhisperlarge-proxy-config
+  namespace: {{ .Release.Namespace }}
+data:
+  nginx.conf: |
+    server {
+      listen {{ .Values.proxy.port }};
+      client_max_body_size 250m;
+      access_log /opt/bitnami/openresty/nginx/logs/access.log;
+      error_log /opt/bitnami/openresty/nginx/logs/error.log;
+
+      proxy_connect_timeout 600s;
+      proxy_read_timeout 600s;
+      proxy_send_timeout 600s;
+      proxy_http_version 1.1;
+      proxy_set_header Host $host;
+      proxy_set_header X-Forwarded-Host $http_host;
+      proxy_set_header X-Forwarded-Proto $scheme;
+      proxy_set_header X-Real-IP $remote_addr;
+      proxy_set_header X-BFL-USER {{ dig "bfl" "username" "" .Values | quote }};
+      proxy_set_header Upgrade $http_upgrade;
+      proxy_set_header Connection "upgrade";
+
+      location / {
+        resolver coredns.kube-system.svc.cluster.local valid=10s;
+        proxy_pass http://{{ .Values.proxy.sharedBackend }}:{{ .Values.proxy.sharedBackendPort }};
+
+        proxy_hide_header Access-Control-Allow-Origin;
+        proxy_hide_header Access-Control-Allow-Methods;
+        proxy_hide_header Access-Control-Allow-Headers;
+        add_header Access-Control-Allow-Origin *;
+        add_header Access-Control-Allow-Methods "GET, POST, PUT, DELETE, OPTIONS, HEAD";
+        add_header Access-Control-Allow-Headers "deviceType,token,authorization,content-type,x-csrftoken";
+
+        if ($request_method = 'OPTIONS') {
+          add_header Access-Control-Allow-Origin *;
+          add_header Access-Control-Allow-Methods "GET, POST, PUT, DELETE, OPTIONS, HEAD";
+          add_header Access-Control-Allow-Headers "deviceType,token,authorization,content-type,x-csrftoken";
+          return 204;
+        }
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: kbwhisperlarge-proxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kbwhisperlarge-proxy
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: kbwhisperlarge-proxy
+    spec:
+      volumes:
+        - name: nginx-config
+          configMap:
+            name: kbwhisperlarge-proxy-config
+            items:
+              - key: nginx.conf
+                path: nginx.conf
+      containers:
+        - name: nginx
+          image: {{ .Values.proxy.image | quote }}
+          ports:
+            - containerPort: {{ .Values.proxy.port }}
+              protocol: TCP
+          env:
+            - name: OPENRESTY_CONF_FILE
+              value: /etc/nginx/nginx.conf
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: {{ .Values.proxy.port }}
+            initialDelaySeconds: 2
+            timeoutSeconds: 5
+            periodSeconds: 5
+            failureThreshold: 60
+          resources:
+            requests:
+              cpu: 10m
+              memory: 64Mi
+            limits:
+              cpu: 100m
+              memory: 256Mi
+          volumeMounts:
+            - name: nginx-config
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+            - name: nginx-config
+              mountPath: /opt/bitnami/openresty/nginx/conf/server_blocks/nginx.conf
+              subPath: nginx.conf
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kbwhisperlarge-svc
+  namespace: {{ .Release.Namespace }}
+spec:
+  type: ClusterIP
+  selector:
+    app: kbwhisperlarge-proxy
+  ports:
+    - name: http
+      protocol: TCP
+      port: {{ .Values.proxy.port }}
+      targetPort: {{ .Values.proxy.port }}

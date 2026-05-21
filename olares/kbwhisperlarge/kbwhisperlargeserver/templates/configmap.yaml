@@ -1,3 +1,4 @@
+{{- if and .Values.admin .Values.bfl.username (eq .Values.admin .Values.bfl.username) }}
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -11,11 +12,12 @@ data:
   WHISPER_DEFAULT_LANGUAGE: {{ .Values.whisper.defaultLanguage | quote }}
   WHISPER_MAX_UPLOAD_SIZE_MB: {{ .Values.whisper.maxUploadSizeMb | quote }}
   WHISPER_ENABLE_DOCS: {{ .Values.whisper.enableDocs | quote }}
-  HF_ENDPOINT: {{ .Values.olaresEnv.OLARES_USER_HUGGINGFACE_SERVICE | default "https://huggingface.co/" | quote }}
-  HF_TOKEN: {{ .Values.olaresEnv.OLARES_USER_HUGGINGFACE_TOKEN | default "" | quote }}
-  HUGGING_FACE_HUB_TOKEN: {{ .Values.olaresEnv.OLARES_USER_HUGGINGFACE_TOKEN | default "" | quote }}
+  HF_ENDPOINT: {{ dig "olaresEnv" "OLARES_USER_HUGGINGFACE_SERVICE" "https://huggingface.co/" .Values | quote }}
+  HF_TOKEN: {{ dig "olaresEnv" "OLARES_USER_HUGGINGFACE_TOKEN" "" .Values | quote }}
+  HUGGING_FACE_HUB_TOKEN: {{ dig "olaresEnv" "OLARES_USER_HUGGINGFACE_TOKEN" "" .Values | quote }}
   HF_HOME: /data/huggingface
   HF_HUB_CACHE: /data/huggingface/hub
   TRANSFORMERS_CACHE: /data/huggingface/transformers
   NVIDIA_VISIBLE_DEVICES: {{ .Values.whisper.nvidiaVisibleDevices | quote }}
   NVIDIA_DRIVER_CAPABILITIES: {{ .Values.whisper.nvidiaDriverCapabilities | quote }}
+{{- end }}
